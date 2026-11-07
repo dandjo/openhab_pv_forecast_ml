@@ -13,23 +13,36 @@ forecast those days about as well as a plain physical forecast (the irradiance t
 temperature, scaled by one factor fitted on the same days). The check catches a broken training, which lands far
 above that; a failed one keeps the models in use and sends a push notification through an openHAB script.
 
+A string of several planes whose modules report their power by plane (power optimizers) can have its forecast split
+among them: a model per plane learns the plane's energy, and its share of the planes' sum splits the string's forecast,
+so that the planes add up to it. Where the planes' measurements began only after the string's, stand-ins fill the
+earlier hours: the string's measured energy split by the planes' physical estimates times a factor per plane fitted on
+all of the planes' measurements. Within SEASON_MARGIN_DAYS of a day of the year with measurements there are no
+stand-ins, so that the measurements replace them season by season. The planes' training has a check of its own,
+against that physical split.
+
 The settings come from the environment, PV_FORECAST_ML_<setting>, the README lists them: PLANES and STRINGS must be
 set, the location falls back to openHAB's regional settings, the rest has defaults.
 
 Commands:
-  update     add the days missing up to yesterday to the weather cache and to the cache of the strings' energy per
-             hour, and drop from both the days before the first PV reading openHAB's persistence still holds
+  update     add the days missing up to yesterday to the weather cache and to the caches of the strings' and the
+             measured planes' energy per hour, and drop the days before the first PV reading openHAB's persistence
+             still holds
   train      update, then train and check a candidate; if it passes, the models trained on all days replace the ones
              in use, else those stay (exit 1, a warning in the log, a push notification through NOTIFY_RULE)
   forecast   today's and tomorrow's hours from the forecast API into openHAB: pv_forecast_hourly (JSON {at, trained,
-             source, h: [[hour's start, W], ...]}), pv_forecast_power and each string's forecast item, each hour's
-             mean at its middle as forecast series through openHAB's persistence (only changed points),
+             source, h: [[hour's start, W], ...]}), pv_forecast_power, each string's and each measured plane's
+             forecast item, each hour's mean at its middle as forecast series through openHAB's persistence (only
+             changed points),
              pv_forecast_energy with each day's total at its 23:59:59, and their states (the running hour's, today's
              total) as well as pv_forecast_energy_tomorrow; without a model the plain physical forecast with the last
              training's factor
   backfill FROM [--apply]
              the forecast as the models would have made it from FROM to yesterday, month by month as train decides,
              with --apply written into the forecast series, the points replaced saved before in the state directory
+  backfill FROM --planes [--apply]
+             the same for the measured planes alone: the strings' forecast as stored, split by the planes' models
+             month by month as train decides; the house's and the strings' series stay
   restore FILE
              write the points of such a backup back
   status     the last training's figures and the caches' extent
@@ -92,6 +105,38 @@ def parse_strings(text):
     return strings
 
 
+# a plane with a measured power of its own (power optimizers): the item of that power and the item its forecast goes to
+PlaneItem = collections.namedtuple("PlaneItem", "plane measured_item forecast_item")
+
+
+def parse_plane_items(text):
+    """{plane: PlaneItem} from plane:measured item:forecast item, comma-separated; empty for none"""
+    items = {}
+    for entry in filter(None, (part.strip() for part in text.split(","))):
+        plane, measured_item, forecast_item = entry.split(":")
+        items[plane] = PlaneItem(plane, measured_item, forecast_item)
+    return items
+
+
+def plane_splits(strings, plane_items):
+    """[(a string's index, the PlaneItems of its planes in its order)] for each string whose planes are measured each:
+    such a string's forecast is split among its planes. A measured plane must share its string with others, and all
+    of them must be measured"""
+    splits = []
+    for index, string in enumerate(strings):
+        measured = [plane for plane in string.planes if plane in plane_items]
+        if not measured:
+            continue
+        if len(string.planes) < 2 or len(measured) != len(string.planes):
+            sys.exit("PV_FORECAST_ML_PLANE_ITEMS: give all planes of a string of several planes an item, or none "
+                     "(see the README)")
+        splits.append((index, [plane_items[plane] for plane in string.planes]))
+    unknown = set(plane_items) - {item.plane for _, items in splits for item in items}
+    if unknown:
+        sys.exit(f"PV_FORECAST_ML_PLANE_ITEMS: {', '.join(sorted(unknown))} is not a plane of PV_FORECAST_ML_STRINGS")
+    return splits
+
+
 TIMEZONE = ZoneInfo(setting("TIMEZONE", system_timezone()))
 STATE_DIR = os.path.expanduser(setting("STATE", "~/.local/state/pv_forecast_ml"))
 OPENHAB_REST = setting("OPENHAB_URL", "http://127.0.0.1:8080").rstrip("/") + "/rest"
@@ -102,6 +147,9 @@ FORECAST_API = setting("FORECAST_API", "https://api.open-meteo.com/v1/forecast")
 HISTORICAL_API = setting("HISTORICAL_API", "https://historical-forecast-api.open-meteo.com/v1/forecast")
 PLANES = parse_planes(setting("PLANES"))
 STRINGS = parse_strings(setting("STRINGS"))
+# the strings whose forecast is split among their planes, and those planes' items in the order of their columns
+SPLITS = plane_splits(STRINGS, parse_plane_items(setting("PLANE_ITEMS", "")))
+MEASURED_PLANES = [item for _, items in SPLITS for item in items]
 # no day before it is used, nor any before the first PV reading
 FIRST_DAY = datetime.date.fromisoformat(setting("FIRST", "2000-01-01"))
 WEATHER_MODELS = setting("MODELS", "best_match,icon_eu,ecmwf_ifs025,meteofrance_seamless,ukmo_seamless,knmi_seamless,"
@@ -128,6 +176,8 @@ CHECK_DAYS = 60
 # weekly over more than a year, a sound candidate came out 0.44 to 0.6 times the plain forecast's error in summer and
 # winter, but up to 1.01 in calm autumn weeks, when one factor fits well
 CHECK_TOLERANCE = 1.2
+# a day of the year this close to a day with the planes' own measurements gets no stand-in values for them
+SEASON_MARGIN_DAYS = 15
 MODEL_PARAMETERS = dict(max_iter=400, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=40, l2_regularization=1.0,
                         random_state=0)
 
@@ -135,11 +185,15 @@ HOURLY_ITEM = "pv_forecast_hourly"
 HOUSE_POWER_ITEM = "pv_forecast_power"
 ENERGY_ITEM = "pv_forecast_energy"
 ENERGY_TOMORROW_ITEM = "pv_forecast_energy_tomorrow"
-POWER_ITEMS = [HOUSE_POWER_ITEM, *(string.forecast_item for string in STRINGS)]  # the house's, then the strings'
+# the house's, then the strings', then the measured planes'
+POWER_ITEMS = [HOUSE_POWER_ITEM, *(string.forecast_item for string in STRINGS),
+               *(item.forecast_item for item in MEASURED_PLANES)]
 
 WEATHER_CACHE_FILE = os.path.join(STATE_DIR, "weather.csv")
 MEASURED_CACHE_FILE = os.path.join(STATE_DIR, "measured.csv")
 MODEL_FILE = os.path.join(STATE_DIR, "model.joblib")
+PLANES_CACHE_FILE = os.path.join(STATE_DIR, "planes.csv")
+PLANES_MODEL_FILE = os.path.join(STATE_DIR, "planes.joblib")
 META_FILE = os.path.join(STATE_DIR, "meta.json")
 SENT_FILE = os.path.join(STATE_DIR, "sent.json")
 
@@ -417,6 +471,76 @@ def update_measured_cache():
     return measured
 
 
+def load_planes_cache():
+    """{hour's start: (each measured plane's kWh, in the order of MEASURED_PLANES)}; empty when the file holds other
+    planes"""
+    if not MEASURED_PLANES or not os.path.exists(PLANES_CACHE_FILE):
+        return {}
+    with open(PLANES_CACHE_FILE) as f:
+        reader = csv.reader(f)
+        if next(reader)[1:] != [f"{item.plane}_kwh" for item in MEASURED_PLANES]:
+            return {}
+        return {int(row[0]): tuple(float(value) for value in row[1:]) for row in reader}
+
+
+def first_planes_day():
+    """the day after the first measured plane's first reading in openHAB's persistence (its first day is mostly
+    partial), not before the strings' first day; None without any reading"""
+    query = urllib.parse.urlencode({"serviceId": PERSISTENCE_SERVICE, "starttime": iso_time(day_start(FIRST_DAY)),
+                                    "page": 0, "pagelength": 1})
+    rows = openhab_request("GET", f"/persistence/items/{MEASURED_PLANES[0].measured_item}?{query}").get("data", [])
+    if not rows:
+        return None
+    return max(first_measured_day(), local_day(rows[0]["time"] / 1000) + datetime.timedelta(days=1))
+
+
+def update_planes_cache():
+    """the measured planes' energy per hour from openHAB's persistence, the days missing up to yesterday, the last two
+    again. A day keeps the hours with readings of every plane from its first such hour to its last, and the hours
+    before and after as 0, when the modules lay dark; an hour without readings in between is a gap and left out"""
+    if not MEASURED_PLANES:
+        return {}
+    planes = load_planes_cache()
+    first = first_planes_day()
+    if first is None:
+        log("planes cache: no reading of the measured planes yet")
+        return {}
+    today = datetime.datetime.now(TIMEZONE).date()
+    dropped = [hour for hour in planes if local_day(hour) < first]
+    for hour in dropped:
+        del planes[hour]
+    last = max((local_day(hour) for hour in planes), default=None)
+    day = first if last is None else max(first, last - datetime.timedelta(days=2))
+    read = 0
+    while day < today:
+        start, end = day_start(day), day_start(day + datetime.timedelta(days=1))
+        readings = [read_history(item.measured_item, start, end - 0.001) for item in MEASURED_PLANES]
+        per_plane = [hourly_energy(plane_readings, start, end) for plane_readings in readings]
+        for hour in [hour for hour in planes if start <= hour < end]:
+            del planes[hour]
+        # the hours with readings of every plane; openHAB's boundary values sit at the day's first and last instant
+        with_readings = set.intersection(*({int(epoch // 3600 * 3600) for epoch, _ in plane_readings
+                                            if start < epoch < end - 0.001} for plane_readings in readings))
+        if with_readings:
+            first_hour, last_hour = min(with_readings), max(with_readings)
+            for hour in range(start, end, 3600):
+                if hour in with_readings:
+                    planes[hour] = tuple(energy[hour] for energy in per_plane)
+                    read += 1
+                elif hour < first_hour or hour > last_hour:
+                    planes[hour] = (0.0,) * len(MEASURED_PLANES)
+        day += datetime.timedelta(days=1)
+    with open(PLANES_CACHE_FILE + ".tmp", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["t", *(f"{item.plane}_kwh" for item in MEASURED_PLANES)])
+        for hour in sorted(planes):
+            writer.writerow([hour, *(round(kwh, 6) for kwh in planes[hour])])
+    os.replace(PLANES_CACHE_FILE + ".tmp", PLANES_CACHE_FILE)
+    log(f"planes cache: {len(planes)} hours from {first} to {today - datetime.timedelta(days=1)}, {read} read, "
+        f"{len(dropped)} dropped")
+    return planes
+
+
 # ---------------------------------------------------------------- the plain physical forecast: the check's benchmark
 
 def physical_estimate(weather, plane_names):
@@ -516,6 +640,176 @@ def check_candidate(hours, features, energies, estimates, split, until):
     return [house] + per_string
 
 
+# ---------------------------------------------------------------- the planes of a split string
+
+def split_columns(split_index):
+    """the columns of a split's planes in the planes cache, which holds the splits' planes one after the other"""
+    offset = sum(len(items) for _, items in SPLITS[:split_index])
+    return list(range(offset, offset + len(SPLITS[split_index][1])))
+
+
+def plane_estimates(weather, hours, items):
+    """each plane's physical estimate on its own for the hours, a column per plane"""
+    import numpy as np
+    return np.array([[physical_estimate(weather[int(hour)], [item.plane]) for item in items] for hour in hours],
+                    dtype=float).reshape(len(hours), len(items))
+
+
+def plane_measurements(planes, hours, columns, string_energy):
+    """the planes' measured kWh for the hours, a column per plane, NaN where the planes cache has none; also NaN
+    where the planes lay dark while their string produced (readings that came late)"""
+    import numpy as np
+    measured = np.full((len(hours), len(columns)), np.nan)
+    for row, hour in enumerate(hours):
+        values = planes.get(int(hour))
+        if values is not None:
+            measured[row] = [values[column] for column in columns]
+    dark = (np.nan_to_num(measured).sum(1) == 0) & (string_energy > 0.05)
+    measured[dark] = np.nan
+    return measured
+
+
+def plane_factors(measured, estimates, string_energy, known, items):
+    """from the hours with measurements: each plane's measured energy over its physical estimate, and the ratio of
+    the planes' measured energy to their string's (power optimizers measure at the modules, the inverter at the
+    string); None while there are none"""
+    if not known.any() or (estimates[known].sum(0) <= 0).any() or string_energy[known].sum() <= 0:
+        return None
+    factors = measured[known].sum(0) / estimates[known].sum(0)
+    return {"planes": {item.plane: round(float(factor), 5) for item, factor in zip(items, factors)},
+            "ratio": round(float(measured[known].sum() / string_energy[known].sum()), 5)}
+
+
+def physical_shares(estimates, factors, items):
+    """each plane's share of its string: the physical estimates times the planes' factors (without factors the
+    estimates alone), by the modules where all are 0"""
+    import numpy as np
+    weights = estimates * np.array([factors["planes"][item.plane] for item in items]) if factors else estimates
+    total = weights.sum(1, keepdims=True)
+    modules = np.array([PLANES[item.plane].modules for item in items], dtype=float)
+    return np.where(total > 0, weights / np.where(total > 0, total, 1), modules / modules.sum())
+
+
+def model_shares(models, features, fallback):
+    """each plane's share of its string from its model's energy, the fallback's where the models give none"""
+    import numpy as np
+    predicted = predict_energies(models, features)
+    total = predicted.sum(1, keepdims=True)
+    return np.where(total > 1e-6, predicted / np.where(total > 1e-6, total, 1), fallback)
+
+
+def outside_measured_seasons(hours, measured_days):
+    """for each hour whether its day of the year lies more than SEASON_MARGIN_DAYS from every day with the planes'
+    measurements: only there stand-ins may fill in for them"""
+    import numpy as np
+    covered = np.zeros(367, dtype=bool)
+    for day in measured_days:
+        day_of_year = day.timetuple().tm_yday
+        for offset in range(-SEASON_MARGIN_DAYS, SEASON_MARGIN_DAYS + 1):
+            covered[(day_of_year - 1 + offset) % 366 + 1] = True
+    return np.array([not covered[local_day(int(hour)).timetuple().tm_yday] for hour in hours], dtype=bool)
+
+
+def plane_targets(hours, measured, estimates, string_energy, factors, items, until):
+    """the planes' energies to learn from the hours before until, a column per plane: their measurements, and where
+    there are none, outside the seasons measured, stand-ins: the string's measured energy times the factors' ratio,
+    split by the physical shares with the factors. Returns the targets, the hours that have them, and the counts of
+    measured and of stand-in hours"""
+    import numpy as np
+    before = hours < until
+    known = before & ~np.isnan(measured).any(1)
+    stand_in = before & ~known & outside_measured_seasons(hours, {local_day(int(hour)) for hour in hours[known]})
+    targets = np.where(known[:, None], np.nan_to_num(measured), 0.0)
+    shares = physical_shares(estimates, factors, items)
+    targets[stand_in] = (string_energy[stand_in] * factors["ratio"])[:, None] * shares[stand_in]
+    return targets, known | stand_in, int(known.sum()), int(stand_in.sum())
+
+
+def check_plane_candidate(hours, features, measured, estimates, string_energy, factors, items, split, until):
+    """a candidate for a split's planes trained on the hours before split, against the physical shares with the
+    factors (from all measurements: they calibrate, they do not forecast), both splitting the string's measured
+    energy, on the hours from split to until with measurements: [(the candidate's error, the physical shares', days)]
+    a plane each, or None without measurements there"""
+    import numpy as np
+    targets, usable, _, _ = plane_targets(hours, measured, estimates, string_energy, factors, items, split)
+    checked = (hours >= split) & (hours < until) & ~np.isnan(measured).any(1)
+    if not checked.any() or not usable.any():
+        return None
+    fallback = physical_shares(estimates[checked], factors, items)
+    shares = model_shares(train_models(features[usable], targets[usable]), features[checked], fallback)
+    energy = string_energy[checked] * factors["ratio"]
+    return [mean_daily_errors(hours[checked], energy * shares[:, column], energy * fallback[:, column],
+                              measured[checked][:, column]) for column in range(len(items))]
+
+
+def train_planes(weather_cache, hours, features, energies, split, until):
+    """for each split string: the planes' factors from all their measurements, a candidate checked like the
+    strings' (against the physical shares with those factors) and, if it passes, the models on all hours with
+    targets. Returns whether all checked candidates passed (None when none could be checked), the splits for the
+    planes' model file, and the figures for the meta file"""
+    import numpy as np
+    planes = update_planes_cache()
+    bundles, verdicts = [], []
+    figures = {"factors": {}, "mae": {}, "measured_hours": 0, "stand_in_hours": 0}
+    for split_index, (string_index, items) in enumerate(SPLITS):
+        string_energy = energies[:, string_index]
+        measured = plane_measurements(planes, hours, split_columns(split_index), string_energy)
+        estimates = plane_estimates(weather_cache, hours, items)
+        factors = plane_factors(measured, estimates, string_energy, ~np.isnan(measured).any(1), items)
+        names = "+".join(item.plane for item in items)
+        if factors is None:
+            log(f"planes {names}: no measurements yet, their forecast splits by the physical estimates")
+            continue
+        figures["factors"][STRINGS[string_index].forecast_item] = factors
+        errors = check_plane_candidate(hours, features, measured, estimates, string_energy, factors, items, split,
+                                       until)
+        if errors is None:
+            log(f"planes {names}: no measurements in the last {CHECK_DAYS} days to check a candidate on")
+            verdicts.append(None)
+            continue
+        figures["check_days"] = errors[0][2]
+        for item, (model_error, plain_error, _) in zip(items, errors):
+            figures["mae"][item.forecast_item] = [round(model_error, 3), round(plain_error, 3)]
+        passed = sum(error[0] for error in errors) <= CHECK_TOLERANCE * sum(error[1] for error in errors)
+        verdicts.append(passed)
+        if passed:
+            targets, usable, measured_hours, stand_in_hours = plane_targets(hours, measured, estimates, string_energy,
+                                                                            factors, items, until)
+            figures["measured_hours"] += measured_hours
+            figures["stand_in_hours"] += stand_in_hours
+            bundles.append({"string": string_index, "planes": [item.plane for item in items], "factors": factors,
+                            "models": train_models(features[usable], targets[usable])})
+    checked = [verdict for verdict in verdicts if verdict is not None]
+    return (all(checked) if checked else None), bundles, figures
+
+
+def split_forecast(string_kwh, features, weather, hour_starts, plane_splits_stored, last_factors):
+    """the measured planes' kWh for the hours, a column per plane in the order of MEASURED_PLANES: each split
+    string's kWh times the ratio of its planes' measurements to its own, split by the planes' models, without them by
+    the physical shares with the last factors (before any measurement by the physical estimates, ratio 1)"""
+    import numpy as np
+    stored = {entry["string"]: entry for entry in plane_splits_stored}
+    columns = []
+    for string_index, items in SPLITS:
+        entry = stored.get(string_index)
+        factors = entry["factors"] if entry else last_factors.get(STRINGS[string_index].forecast_item)
+        fallback = physical_shares(plane_estimates(weather, hour_starts, items), factors, items)
+        shares = model_shares(entry["models"], features, fallback) if entry else fallback
+        energy = np.asarray(string_kwh, dtype=float)[:, string_index] * (factors["ratio"] if factors else 1.0)
+        columns.extend(energy * shares[:, column] for column in range(len(items)))
+    return np.column_stack(columns) if columns else np.zeros((len(hour_starts), 0))
+
+
+def load_planes_bundle():
+    """the splits of the planes' model file, [] without it"""
+    if not MEASURED_PLANES or not os.path.exists(PLANES_MODEL_FILE):
+        return []
+    import joblib
+    bundle = joblib.load(PLANES_MODEL_FILE)
+    assert bundle["features"] == FEATURES, "features changed, train again"
+    return bundle["splits"]
+
+
 def load_meta():
     return json.load(open(META_FILE)) if os.path.exists(META_FILE) else {}
 
@@ -557,8 +851,34 @@ def train():
         notify(f"PV-Prognose: neues Modell verworfen, es lag die letzten {days} Tage {german(model_error)} kWh pro "
                f"Tag daneben, die einfache Rechnung {german(plain_error)}. "
                + (f"Das Modell vom {since} gilt weiter." if since else "Es gilt die einfache Rechnung."))
+    planes_passed = None
+    if SPLITS:
+        planes_passed, plane_bundles, figures = train_planes(weather_cache, hours, features, energies, split,
+                                                             hours[-1] + 1)
+        planes_trained = old_meta.get("planes", {}).get("trained")
+        meta["planes"] = {**figures, "trained": planes_trained}
+        each_plane = "; ".join(f"{item} {errors[0]:.2f} against {errors[1]:.2f}"
+                               for item, errors in figures["mae"].items())
+        if planes_passed:
+            joblib.dump({"splits": plane_bundles, "features": FEATURES}, PLANES_MODEL_FILE + ".tmp")
+            os.replace(PLANES_MODEL_FILE + ".tmp", PLANES_MODEL_FILE)
+            meta["planes"]["trained"] = now
+            log(f"planes trained on {figures['measured_hours']} measured and {figures['stand_in_hours']} stand-in "
+                f"hours; the candidate over the last {figures['check_days']} days against the physical shares "
+                f"({each_plane})")
+        elif planes_passed is False:
+            log(f"WARNING: planes: the candidate over the last {figures['check_days']} days against the physical "
+                f"shares ({each_plane}): the planes' models of {planes_trained} stay")
+            since = datetime.datetime.fromisoformat(planes_trained).strftime("%d.%m.%Y") if planes_trained else None
+            german = lambda value: f"{value:.2f}".replace(".", ",")
+            model_error = sum(errors[0] for errors in figures["mae"].values())
+            plain_error = sum(errors[1] for errors in figures["mae"].values())
+            notify(f"PV-Prognose: neue Aufteilung auf die Himmelsrichtungen verworfen, sie lag die letzten "
+                   f"{figures['check_days']} Tage {german(model_error)} kWh pro Tag daneben, die einfache Aufteilung "
+                   f"{german(plain_error)}. "
+                   + (f"Die Aufteilung vom {since} gilt weiter." if since else "Es gilt die einfache Aufteilung."))
     json.dump(meta, open(META_FILE, "w"), indent=1)
-    if not passed:
+    if not passed or planes_passed is False:
         sys.exit(1)
 
 
@@ -624,18 +944,25 @@ def forecast():
         source = "plain"
     else:
         raise RuntimeError("no model and no training yet: run train")
-    # the strings rounded to whole W, the house their sum
+    plane_kwh = split_forecast(predicted, np.array(vectors, dtype=float), weather, hour_starts, load_planes_bundle(),
+                               meta.get("planes", {}).get("factors", {}))
+    # the strings and the planes rounded to whole W, the house the strings' sum
     hours = []
-    for hour_start, string_kwh, elevation in zip(hour_starts, predicted, elevations):
-        string_watts = [round(float(kwh) * 1000) if elevation > DAYLIGHT_ELEVATION else 0 for kwh in string_kwh]
-        hours.append([hour_start, sum(string_watts), *string_watts])
+    for hour_start, string_kwh, planes_kwh, elevation in zip(hour_starts, predicted, plane_kwh, elevations):
+        daylight = elevation > DAYLIGHT_ELEVATION
+        string_watts = [round(float(kwh) * 1000) if daylight else 0 for kwh in string_kwh]
+        plane_watts = [round(float(kwh) * 1000) if daylight else 0 for kwh in planes_kwh]
+        hours.append([hour_start, sum(string_watts), *string_watts, *plane_watts])
     written = publish(hours, source, meta.get("trained"))
     day_totals = {}
     for hour_start, *watts in hours:
         day = local_day(hour_start)
         day_totals[day] = [total + w / 1000 for total, w in zip(day_totals.get(day, [0.0] * len(watts)), watts)]
+    strings_end = 1 + len(STRINGS)
     log(f"forecast ({source}): "
-        + ", ".join(f"{day} {totals[0]:.1f} kWh ({' + '.join(f'{kwh:.1f}' for kwh in totals[1:])})"
+        + ", ".join(f"{day} {totals[0]:.1f} kWh ({' + '.join(f'{kwh:.1f}' for kwh in totals[1:strings_end])}"
+                    + "".join(f"; {item.plane} {kwh:.1f}" for item, kwh in zip(MEASURED_PLANES, totals[strings_end:]))
+                    + ")"
                     for day, totals in sorted(day_totals.items()) if totals[0] > 0)
         + f"; {written} points written")
 
@@ -711,6 +1038,81 @@ def backfill(first, apply):
     log(f"written {len(points)} points ({len(string_watts)} hours, {len(day_totals)} days); the old ones in {backup}")
 
 
+def backfill_planes(first, apply):
+    """the measured planes' forecast series from first (not before their measurements) to yesterday: each split
+    string's forecast as already stored, split month by month by the planes' models trained on the hours before the
+    month as the nightly training would have trained them; the factors come from the measurements before the month,
+    before the first from all. The house's and the strings' series stay as they are"""
+    import numpy as np
+    if not SPLITS:
+        log("no measured planes (PV_FORECAST_ML_PLANE_ITEMS): nothing to do")
+        return
+    weather_cache = load_weather_cache()
+    latitude, longitude = location()
+    measured = update_measured_cache()
+    planes = update_planes_cache()
+    hours, features, energies, _ = training_data(weather_cache, measured, latitude, longitude)
+    first = max(first, first_planes_day() or first)
+    end = day_start(datetime.datetime.now(TIMEZONE).date())
+    points = []
+    for split_index, (string_index, items) in enumerate(SPLITS):
+        string_energy = energies[:, string_index]
+        measured_planes = plane_measurements(planes, hours, split_columns(split_index), string_energy)
+        estimates = plane_estimates(weather_cache, hours, items)
+        known = ~np.isnan(measured_planes).any(1)
+        all_factors = plane_factors(measured_planes, estimates, string_energy, known, items)
+        if all_factors is None:
+            log(f"planes {'+'.join(item.plane for item in items)}: no measurements yet")
+            continue
+        # the string's stored forecast: each hour's mean at its middle
+        stored = {int(epoch) - 1800: watts / 1000
+                  for epoch, watts in read_history(STRINGS[string_index].forecast_item, day_start(first), end)
+                  if day_start(first) <= epoch - 1800 < end and (int(epoch) - 1800) % 3600 == 0}
+        month = datetime.date(first.year, first.month, 1)
+        while day_start(month) < end:
+            next_month = (month + datetime.timedelta(days=32)).replace(day=1)
+            month_start = day_start(max(month, first))
+            month_hours = sorted(hour for hour in stored if month_start <= hour < day_start(next_month)
+                                 and hour in weather_cache)
+            lit = [hour for hour in month_hours if stored[hour] > 0]
+            factors = plane_factors(measured_planes, estimates, string_energy, known & (hours < month_start), items)
+            factors = factors or all_factors
+            shares = np.zeros((len(lit), len(items)))
+            if lit:
+                targets, usable, _, _ = plane_targets(hours, measured_planes, estimates, string_energy, factors, items,
+                                                      month_start)
+                vectors = np.array([feature_vector(hour, weather_cache[hour], latitude, longitude)[0] for hour in lit],
+                                   dtype=float)
+                fallback = physical_shares(plane_estimates(weather_cache, lit, items), factors, items)
+                shares = model_shares(train_models(features[usable], targets[usable]), vectors, fallback)
+            share_of = dict(zip(lit, shares))
+            for hour in month_hours:
+                kwh = stored[hour] * factors["ratio"]
+                for column, item in enumerate(items):
+                    watts = round(kwh * share_of[hour][column] * 1000) if hour in share_of else 0
+                    points.append((item.forecast_item, hour + 1800, f"{watts} W"))
+            log(f"  {month:%Y-%m} {'+'.join(item.plane for item in items)}: {len(month_hours)} hours, factors "
+                f"{factors['planes']}, ratio {factors['ratio']}")
+            month = next_month
+    if not points:
+        log("nothing to write")
+        return
+    if not apply:
+        log(f"would write {len(points)} points of {len({item for item, _, _ in points})} planes; --apply writes them")
+        return
+    start, stop = min(epoch for _, epoch, _ in points), max(epoch for _, epoch, _ in points)
+    backup = os.path.join(STATE_DIR, f"backup-planes-{datetime.datetime.now(TIMEZONE):%Y%m%d-%H%M%S}.csv")
+    with open(backup, "w", newline="") as f:
+        writer = csv.writer(f)
+        for item in MEASURED_PLANES:
+            for epoch, value in read_history(item.forecast_item, start, stop):
+                if start <= epoch <= stop:
+                    writer.writerow([item.forecast_item, int(epoch), f"{value:g} W"])
+    for item, epoch, state in points:
+        store_point(item, epoch, state)
+    log(f"written {len(points)} points; the old ones in {backup}")
+
+
 def restore(path):
     """the points of a backup written back"""
     count = 0
@@ -729,6 +1131,10 @@ def status():
     measured = load_measured_cache()
     print(f"measured cache: {len(measured)} hours"
           + (f", {local_day(min(measured))} to {local_day(max(measured))}" if measured else ""))
+    if MEASURED_PLANES:
+        planes = load_planes_cache()
+        print(f"planes cache: {len(planes)} hours"
+              + (f", {local_day(min(planes))} to {local_day(max(planes))}" if planes else ""))
 
 
 if __name__ == "__main__":
@@ -736,10 +1142,13 @@ if __name__ == "__main__":
     if command == "update":
         update_weather_cache()
         update_measured_cache()
+        update_planes_cache()
     elif command == "train":
         train()
     elif command == "forecast":
         forecast()
+    elif command == "backfill" and "--planes" in sys.argv:
+        backfill_planes(datetime.date.fromisoformat(sys.argv[2]), "--apply" in sys.argv)
     elif command == "backfill":
         backfill(datetime.date.fromisoformat(sys.argv[2]), "--apply" in sys.argv)
     elif command == "restore":
