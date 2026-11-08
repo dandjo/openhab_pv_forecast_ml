@@ -1,5 +1,5 @@
 // The items pv_forecast_ml writes. The string items are named in PV_FORECAST_ML_STRINGS; add one per string.
-// pv_forecast_power, the string and plane items and pv_forecast_energy get points in the future: persist them with a service that
+// pv_forecast_power, the string, plane and band items and pv_forecast_energy get points in the future: persist them with a service that
 // stores such points (InfluxDB, with the "forecast" strategy). pv_forecast_hourly can be restored at startup (MapDB).
 
 Group         pv_forecast                  "PV forecast"                                    <solarplant>  ["Equipment"]
@@ -12,4 +12,8 @@ Number:Energy pv_forecast_energy_tomorrow  "PV forecast energy tomorrow [%.1f %u
 // optional, with PV_FORECAST_ML_PLANE_ITEMS: one per plane whose power optimizers report, named there
 Number:Power  pv_forecast_west_power       "PV forecast west power [%.0f %unit%]"          <solarplant>  (pv_forecast)  ["Power", "Measurement"]   { unit="W" }
 Number:Power  pv_forecast_north_power      "PV forecast north power [%.0f %unit%]"         <solarplant>  (pv_forecast)  ["Power", "Measurement"]   { unit="W" }
+// optional, with PV_FORECAST_ML_BAND_ITEMS: the band around pv_forecast_power, its width for a chart's stacked area
+Number:Power  pv_forecast_power_low        "PV forecast power low [%.0f %unit%]"           <solarplant>  (pv_forecast)  ["Power", "Measurement"]   { unit="W" }
+Number:Power  pv_forecast_power_high       "PV forecast power high [%.0f %unit%]"          <solarplant>  (pv_forecast)  ["Power", "Measurement"]   { unit="W" }
+Number:Power  pv_forecast_power_band       "PV forecast band width [%.0f %unit%]"          <solarplant>  (pv_forecast)  ["Power", "Measurement"]   { unit="W" }
 String        pv_forecast_hourly           "PV forecast hours"                              <time>        (pv_forecast)  ["Status"]

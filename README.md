@@ -27,6 +27,13 @@ actually produced.
 - **Training data.** Open-Meteo's archived forecasts (its historical forecast API, for the same hours as forecast at
   the time) and the strings' measured power from openHAB's persistence, integrated to energy per hour. Both are cached
   locally; each night adds the day before.
+- **A band around the forecast.** Each string also gets a model of an hour's 10 % and one of its 90 % quantile.
+  Summed hour by hour these bounds are far too wide for a day, as an hour's errors partly cancel over the day, so
+  the house's band is their sum widened or narrowed around the forecast by two factors, fitted at each training on
+  the last 60 days: the rest of a day from 12:00 (`PV_FORECAST_ML_BAND_FROM_HOUR`) then fell below the band on about
+  one day in ten and above it on about one in ten. A rule that must not count on sun that may not come, such as a
+  hot water charge on the PV's surplus, can take the low bound instead of the forecast: close to the forecast on a
+  clear day, well below it on an uncertain one.
 - **A check before every model change.** Each night a candidate is trained on all but the last 60 days and has to
   forecast those 60 days about as well as a plain physical forecast (the irradiance times the modules at the cells'
   temperature, scaled by one factor fitted on the same days). Only if it does, models trained on all days replace the
@@ -46,7 +53,8 @@ actually produced.
 | one item per measured plane, optional | the same for each plane of a split string; together they add up to their string's forecast times the optimizers' ratio |
 | `pv_forecast_energy` | each day's forecast total from today on, at the day's 23:59:59, as a forecast series; its state is today's |
 | `pv_forecast_energy_tomorrow` | tomorrow's forecast total; persisted on change, its history shows the day-ahead forecasts |
-| `pv_forecast_hourly` | JSON `{at, trained, source, h: [[hour's start, W], ...]}` for rules; `source` is `ml`, or `plain` before the first training |
+| `pv_forecast_hourly` | JSON `{at, trained, source, h: [[hour's start, W, low W, high W], ...]}` for rules (the band's bounds only while the models have a band); `source` is `ml`, or `plain` before the first training |
+| the band's items, optional | the band's low and high bound around `pv_forecast_power` as forecast series, and optionally its width (high minus low), which a chart stacks on the low bound to fill the band |
 
 Only changed points are written. If the service stops, the last forecast stays in the items, and the `at` field tells
 rules how old it is.
@@ -86,7 +94,8 @@ rules how old it is.
    ```
 
 The first training fetches the archived forecasts for every day with measurements, which takes a few minutes. After
-that the forecast runs at 2 and 32 minutes past every hour and the training every night at 02:30.
+that the forecast runs at 2 and 32 minutes past every hour and the training every night at 02:30 (about 5 minutes on
+a Raspberry Pi 4 with two strings, two planes and the band).
 
 ## Settings
 
@@ -97,6 +106,8 @@ The service reads its settings from environment variables; the systemd units loa
 | `PV_FORECAST_ML_PLANES` | (required) | the planes of modules, comma-separated, each as `name:azimuth:tilt:modules`; the azimuth in degrees from south with east negative, the tilt in degrees. Example: `e:-90:25:8,w:90:25:8,n:180:25:6` |
 | `PV_FORECAST_ML_STRINGS` | (required) | the inverter's strings, comma-separated, each as `measured power item:forecast power item:planes`, the planes joined by `+`. Example: `pv1_power:pv_forecast_pv1_power:e,pv2_power:pv_forecast_pv2_power:w+n` |
 | `PV_FORECAST_ML_PLANE_ITEMS` | (none) | the planes whose power optimizers report their power, comma-separated, each as `plane:measured power item:forecast power item`; all planes of a string or none. Example: `w:west_power:pv_forecast_west_power,n:north_power:pv_forecast_north_power` |
+| `PV_FORECAST_ML_BAND_ITEMS` | (none) | the band's items, `low item:high item`, optionally `:width item`. Example: `pv_forecast_power_low:pv_forecast_power_high:pv_forecast_power_band`. Without them the band is only in `pv_forecast_hourly` |
+| `PV_FORECAST_ML_BAND_FROM_HOUR` | `12` | the hour from which the rest of a day calibrates the band |
 | `PV_FORECAST_ML_LATITUDE`, `PV_FORECAST_ML_LONGITUDE` | openHAB's location | the installation's location; rounded to 2 decimals, which is finer than the weather models' grid |
 | `PV_FORECAST_ML_TIMEZONE` | the system's | the time zone the days are counted in, e.g. `Europe/Berlin` |
 | `PV_FORECAST_ML_OPENHAB_URL` | `http://127.0.0.1:8080` | openHAB's address |
@@ -145,6 +156,13 @@ training would have done over most of a year, the forecast of a day's total was 
 forecast with factors fitted to the last two weeks was off by 2.3 kWh over the same days. One model per string came
 out as well as one model for the whole house, and it gives each string a forecast of its own. More history helped:
 trained on the last 6 months, the error was 2.44 kWh a day, on 12 months 1.94, on all 18 to 24 months 1.89.
+
+The band, retrained every two weeks over 2026 with its factors fitted on the 60 days before each day: of the rest
+of a day from 12:00, 8.6 % of the days fell below it and 10.4 % above, its mean width 4.7 kWh; a band of fixed
+ratios around the forecast, fitted on the same 60 days, came out as reliable but 6.3 kWh wide, as it cannot be
+narrow on a clear day (14 August 2026, from 12:00: 27.8 to 28.7 kWh against 25.4 to 30.7; 28.2 measured) and wide
+on an uncertain one. For a whole day: 11.1 % below and 11.1 % above, 7.4 kWh wide against 8.9. The quantiles alone,
+summed over the hours, left only 2.7 % of the days below and 1.0 % above, at up to 22 kWh in spring.
 
 Splitting a string of two planes (8 modules west, 6 north) with planes' models trained on 7 weeks of optimizer
 measurements plus stand-ins, retrained weekly over 5 autumn weeks: west 0.53 kWh a day off, north 0.27; the
