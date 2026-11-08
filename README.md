@@ -143,6 +143,7 @@ set -a; . ~/.venv/pv_forecast_ml/.env; set +a
 | `forecast` | writes today's and tomorrow's forecast into openHAB |
 | `backfill FROM [--apply]` | computes the forecast the models would have made from the day `FROM` on, month by month as the nightly check would have decided; with `--apply` it writes it into the forecast series, after saving the points it replaces |
 | `backfill FROM --planes [--apply]` | the same for the measured planes alone: splits the strings' forecast as already stored, month by month with the planes' models trained before the month; the house's and the strings' series stay |
+| `backfill FROM --band [--apply]` | the band's series from the day `FROM` up to its first point (it replaces none), month by month as the nightly training would have made it, round the house's forecast as stored; logs how often each month's measurement fell outside it |
 | `restore FILE` | writes the points of such a backup back |
 
 The energy per hour is integrated from the power readings as InfluxDB's `integral()` does it: trapezoids between the

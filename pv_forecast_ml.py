@@ -1216,6 +1216,100 @@ def backfill_planes(first, apply):
     log(f"written {len(points)} points; the old ones in {backup}")
 
 
+def backfill_band(first, apply):
+    """the band's series from first up to its first point (it replaces none): month by month as the nightly training
+    would have made it, the factors fitted on the CHECK_DAYS days before the month with a candidate and quantile models
+    trained on the hours before those (not with fewer than 90 days to train on, as backfill), the quantile models of
+    the month trained on the hours before it; the band round the house's forecast as stored, 0 at night. Logs for
+    each month how often the measurement fell below and above it, of the rest of a day from BAND_FROM_HOUR and of the
+    whole day"""
+    import numpy as np
+    if not BAND_ITEMS:
+        log("no band items (PV_FORECAST_ML_BAND_ITEMS): nothing to do")
+        return
+    weather_cache = load_weather_cache()
+    latitude, longitude = location()
+    measured = update_measured_cache()
+    hours, features, energies, _ = training_data(weather_cache, measured, latitude, longitude)
+    start = day_start(first)
+    held = [epoch for epoch, _ in read_history(BAND_ITEMS[0], start, time.time()) if epoch >= start]
+    end = int(min(held)) - 1800 if held else day_start(datetime.datetime.now(TIMEZONE).date())
+    # the house's stored forecast: each hour's mean at its middle
+    stored = {int(epoch) - 1800: watts for epoch, watts in read_history(HOUSE_POWER_ITEM, start, end)
+              if start <= epoch - 1800 < end and (int(epoch) - 1800) % 3600 == 0}
+    points, missed = [], {"rest": [0, 0, 0], "day": [0, 0, 0]}
+    month = datetime.date(first.year, first.month, 1)
+    while day_start(month) < end:
+        next_month = (month + datetime.timedelta(days=32)).replace(day=1)
+        month_start = day_start(max(month, first))
+        month_hours = sorted(hour for hour in stored if month_start <= hour < day_start(next_month)
+                             and hour in weather_cache)
+        split = day_start(max(month, first) - datetime.timedelta(days=CHECK_DAYS))
+        if not month_hours:
+            month = next_month
+            continue
+        if split - hours[0] < 90 * 86400:
+            log(f"  {month:%Y-%m}: skipped (less than 90 days to train a candidate on)")
+            month = next_month
+            continue
+        before_split, checked = hours < split, (hours >= split) & (hours < month_start)
+        candidate = train_models(features[before_split], energies[before_split])
+        band = band_factors(hours, features, energies, split, month_start,
+                            predict_energies(candidate, features[checked]))
+        if band is None:
+            log(f"  {month:%Y-%m}: skipped (fewer than {BAND_MIN_DAYS} days to fit the factors on)")
+            month = next_month
+            continue
+        before = hours < month_start
+        low_models, high_models = train_band(features[before], energies[before])
+        vectors, elevations = zip(*(feature_vector(hour, weather_cache[hour], latitude, longitude)
+                                    for hour in month_hours))
+        matrix = np.array(vectors, dtype=float)
+        house = np.array([stored[hour] / 1000 for hour in month_hours])
+        lower, upper = house_band(house, predict_energies(low_models, matrix).sum(1),
+                                  predict_energies(high_models, matrix).sum(1), band["factors"])
+        days = {}
+        for hour, low, high, elevation in zip(month_hours, lower, upper, elevations):
+            daylight = elevation > DAYLIGHT_ELEVATION
+            watts = round(stored[hour])
+            low_watts = min(round(float(low) * 1000), watts) if daylight else 0
+            high_watts = max(round(float(high) * 1000), watts) if daylight else 0
+            points += [(item, hour + 1800, f"{value} W")
+                       for item, value in zip(BAND_ITEMS, (low_watts, high_watts, high_watts - low_watts))]
+            if hour in measured:
+                rest = datetime.datetime.fromtimestamp(hour, TIMEZONE).hour >= BAND_FROM_HOUR
+                totals = days.setdefault(local_day(hour), [0.0] * 6)
+                for offset, counted in ((0, True), (3, rest)):
+                    if counted:
+                        totals[offset] += low_watts / 1000
+                        totals[offset + 1] += high_watts / 1000
+                        totals[offset + 2] += sum(measured[hour])
+        figures = []
+        for key, offset in (("day", 0), ("rest", 3)):
+            below = sum(totals[offset + 2] < totals[offset] - 0.005 for totals in days.values())
+            above = sum(totals[offset + 2] > totals[offset + 1] + 0.005 for totals in days.values())
+            missed[key] = [missed[key][0] + below, missed[key][1] + above, missed[key][2] + len(days)]
+            figures.append(f"{below} below and {above} above")
+        log(f"  {month:%Y-%m}: factors {band['factors'][0]:.2f} below and {band['factors'][1]:.2f} above; of "
+            f"{len(days)} days {figures[1]} from {BAND_FROM_HOUR}:00, {figures[0]} over the whole day")
+        month = next_month
+    if not points:
+        log("nothing to write")
+        return
+    for key, text in (("rest", f"the rest of a day from {BAND_FROM_HOUR}:00"), ("day", "the whole day")):
+        below, above, count = missed[key]
+        if count:
+            log(f"{text}: {below / count:.1%} of {count} days below the band, {above / count:.1%} above")
+    hours_written = len(points) // len(BAND_ITEMS)
+    if not apply:
+        log(f"would write {len(points)} points ({hours_written} hours); --apply writes them")
+        return
+    for item, epoch, state in points:
+        store_point(item, epoch, state)
+    log(f"written {len(points)} points ({hours_written} hours) from {iso_time(min(e for _, e, _ in points))} to "
+        f"{iso_time(max(e for _, e, _ in points))}")
+
+
 def restore(path):
     """the points of a backup written back"""
     count = 0
@@ -1250,6 +1344,8 @@ if __name__ == "__main__":
         train()
     elif command == "forecast":
         forecast()
+    elif command == "backfill" and "--band" in sys.argv:
+        backfill_band(datetime.date.fromisoformat(sys.argv[2]), "--apply" in sys.argv)
     elif command == "backfill" and "--planes" in sys.argv:
         backfill_planes(datetime.date.fromisoformat(sys.argv[2]), "--apply" in sys.argv)
     elif command == "backfill":
