@@ -21,12 +21,6 @@ all of the planes' measurements. Within SEASON_MARGIN_DAYS of a day of the year 
 stand-ins, so that the measurements replace them season by season. The planes' training has a check of its own,
 against that physical split.
 
-Around the house's forecast lies a band: per string a model of an hour's 10 % and one of its 90 % quantile, their sums
-for the house widened or narrowed around the forecast by two factors fitted at each training on the candidate's last
-60 days, so that the rest of a day from BAND_FROM_HOUR (12:00, when a sun budget for the hot water starts) fell
-below the band on about one day in ten and above it on about one in ten. Summed hour by hour, the raw quantiles were
-far too wide, as an hour's errors partly cancel over a day.
-
 The settings come from the environment, PV_FORECAST_ML_<setting>, the README lists them: PLANES and STRINGS must be
 set, the location falls back to openHAB's regional settings, the rest has defaults.
 
@@ -39,8 +33,7 @@ Commands:
   forecast   today's and tomorrow's hours from the forecast API into openHAB: pv_forecast_hourly (JSON {at, trained,
              source, h: [[hour's start, W], ...]}), pv_forecast_power, each string's and each measured plane's
              forecast item, each hour's mean at its middle as forecast series through openHAB's persistence (only
-             changed points), with a band each hour as [start, W, low W, high W] in pv_forecast_hourly and into the
-             band's items,
+             changed points),
              pv_forecast_energy with each day's total at its 23:59:59, and their states (the running hour's, today's
              total) as well as pv_forecast_energy_tomorrow; without a model the plain physical forecast with the last
              training's factor
@@ -187,13 +180,6 @@ CHECK_TOLERANCE = 1.2
 SEASON_MARGIN_DAYS = 15
 MODEL_PARAMETERS = dict(max_iter=400, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=40, l2_regularization=1.0,
                         random_state=0)
-# the band around the house's forecast: per string a model for each of these quantiles of an hour's energy, their sum
-# for the house widened or narrowed around the forecast by two factors, so that over the last CHECK_DAYS days the rest
-# of a day from BAND_FROM_HOUR fell below the band on the first share of the days and above it on the share left by
-# the second; hours summed, the raw quantiles alone were far too wide (their errors partly cancel over a day)
-BAND_QUANTILES = (0.1, 0.9)
-BAND_FROM_HOUR = int(setting("BAND_FROM_HOUR", "12"))
-BAND_MIN_DAYS = 20  # fewer days to fit the factors on: no band
 
 HOURLY_ITEM = "pv_forecast_hourly"
 HOUSE_POWER_ITEM = "pv_forecast_power"
@@ -202,11 +188,6 @@ ENERGY_TOMORROW_ITEM = "pv_forecast_energy_tomorrow"
 # the house's, then the strings', then the measured planes'
 POWER_ITEMS = [HOUSE_POWER_ITEM, *(string.forecast_item for string in STRINGS),
                *(item.forecast_item for item in MEASURED_PLANES)]
-# the band's items, optional: its low and its high bound, and optionally its width (high minus low, for a chart that
-# stacks it on the low bound to fill the band)
-BAND_ITEMS = [name for name in setting("BAND_ITEMS", "").split(":") if name]
-if len(BAND_ITEMS) not in (0, 2, 3):
-    sys.exit("PV_FORECAST_ML_BAND_ITEMS: low item:high item, optionally :width item (see the README)")
 
 WEATHER_CACHE_FILE = os.path.join(STATE_DIR, "weather.csv")
 MEASURED_CACHE_FILE = os.path.join(STATE_DIR, "measured.csv")
@@ -602,16 +583,15 @@ def training_data(weather_cache, measured, latitude, longitude):
     return np.array(hours), np.array(features, dtype=float), np.array(energies), np.array(estimates)
 
 
-def train_models(features, energies, **objective):
+def train_models(features, energies):
     """a model per string, each on the feature columns with enough values: a weather model not yet archived over the
-    training days (one archived only recently) is left out, as an empty column stops the training; objective, e.g.
-    loss="quantile", quantile=0.1, for a quantile instead of the mean"""
+    training days (one archived only recently) is left out, as an empty column stops the training"""
     import numpy as np
     from sklearn.ensemble import HistGradientBoostingRegressor
     used_columns = np.where((~np.isnan(features)).sum(axis=0) >= MIN_VALUES_PER_COLUMN)[0]
     models = []
     for string_index in range(energies.shape[1]):
-        model = HistGradientBoostingRegressor(**{**MODEL_PARAMETERS, **objective})
+        model = HistGradientBoostingRegressor(**MODEL_PARAMETERS)
         model.fit(features[:, used_columns], energies[:, string_index])
         model.feature_columns = used_columns
         models.append(model)
@@ -648,7 +628,7 @@ def mean_daily_errors(hours, forecast, reference, measured):
 def check_candidate(hours, features, energies, estimates, split, until):
     """a candidate trained on the hours before split, against the plain forecast fitted on the same hours (one factor
     for all planes), on the hours from split to until: (the candidate's error, the plain forecast's, days) for the
-    house, then for each string; and the candidate's energies for those hours, a column per string"""
+    house, then for each string"""
     before = hours < split
     checked = (hours >= split) & (hours < until)
     predicted = predict_energies(train_models(features[before], energies[before]), features[checked])
@@ -657,51 +637,7 @@ def check_candidate(hours, features, energies, estimates, split, until):
     house = mean_daily_errors(hours[checked], predicted.sum(1), reference.sum(1), measured.sum(1))
     per_string = [mean_daily_errors(hours[checked], predicted[:, index], reference[:, index], measured[:, index])
                   for index in range(energies.shape[1])]
-    return [house] + per_string, predicted
-
-
-def train_band(features, energies):
-    """the band's quantile models, (low models, high models), a model per string each"""
-    return tuple(train_models(features, energies, loss="quantile", quantile=share) for share in BAND_QUANTILES)
-
-
-def house_band(forecast, low, high, factors):
-    """the house's band around its forecast (kWh per hour; forecast, low and high the strings' sums): the raw
-    quantiles' half-widths times the two factors, never below 0, never across the forecast"""
-    import numpy as np
-    lower = np.maximum(forecast - factors[0] * np.maximum(forecast - np.minimum(low, high), 0), 0)
-    upper = forecast + factors[1] * np.maximum(np.maximum(low, high) - forecast, 0)
-    return lower, upper
-
-
-def band_factors(hours, features, energies, split, until, predicted):
-    """the band's two factors from quantile models trained on the hours before split and the candidate's forecast
-    (predicted) of the hours from split to until: for each day's rest from BAND_FROM_HOUR, the house's, how far the
-    measurement fell below (above) the forecast in units of the raw quantiles' lower (upper) half-width; the factors
-    are the distances that the shares of BAND_QUANTILES of the days exceeded, so that as many would have fallen
-    outside. Returns {factors, days, raw_outside}, or None with fewer than BAND_MIN_DAYS days"""
-    import numpy as np
-    before, checked = hours < split, (hours >= split) & (hours < until)
-    low_models, high_models = train_band(features[before], energies[before])
-    columns = (predicted.sum(1), predict_energies(low_models, features[checked]).sum(1),
-               predict_energies(high_models, features[checked]).sum(1), energies[checked].sum(1))
-    days = {}
-    for hour, *values in zip(hours[checked], *columns):
-        moment = datetime.datetime.fromtimestamp(int(hour), TIMEZONE)
-        if moment.hour >= BAND_FROM_HOUR:
-            totals = days.setdefault(moment.date(), [0.0] * 4)
-            for index, value in enumerate(values):
-                totals[index] += value
-    if len(days) < BAND_MIN_DAYS:
-        return None
-    forecast, low, high, measured = np.array(list(days.values())).T
-    low, high = np.minimum(low, high), np.maximum(low, high)
-    below = (forecast - measured) / np.maximum(forecast - low, 0.05)
-    above = (measured - forecast) / np.maximum(high - forecast, 0.05)
-    factors = [max(0.0, float(np.quantile(below, 1 - BAND_QUANTILES[0]))),
-               max(0.0, float(np.quantile(above, BAND_QUANTILES[1])))]
-    return {"factors": [round(factor, 4) for factor in factors], "days": len(days),
-            "raw_outside": [round(float(np.mean(measured < low)), 3), round(float(np.mean(measured > high)), 3)]}
+    return [house] + per_string
 
 
 # ---------------------------------------------------------------- the planes of a split string
@@ -885,8 +821,8 @@ def train():
     measured = update_measured_cache()
     hours, features, energies, estimates = training_data(weather_cache, measured, latitude, longitude)
     split = day_start(local_day(int(hours[-1])) - datetime.timedelta(days=CHECK_DAYS - 1))
-    ((model_error, plain_error, days), *string_errors), predicted = check_candidate(hours, features, energies,
-                                                                                    estimates, split, hours[-1] + 1)
+    (model_error, plain_error, days), *string_errors = check_candidate(hours, features, energies, estimates, split,
+                                                                       hours[-1] + 1)
     old_meta = load_meta()
     now = datetime.datetime.now(TIMEZONE).isoformat(timespec="seconds")
     meta = {"checked": now, "rows": int(len(energies)), "check_days": days, "forecast_mae": round(model_error, 3),
@@ -901,23 +837,11 @@ def train():
     each_string = "; ".join(f"string {number} {errors[0]:.2f} against {errors[1]:.2f}"
                             for number, errors in enumerate(string_errors, 1))
     if passed:
-        bundle = {"models": train_models(features, energies), "features": FEATURES}
-        band = band_factors(hours, features, energies, split, hours[-1] + 1, predicted)
-        if band:
-            low_models, high_models = train_band(features, energies)
-            bundle["band"] = {"low": low_models, "high": high_models, "factors": band["factors"]}
-            meta["band"] = {**band, "from_hour": BAND_FROM_HOUR}
-        joblib.dump(bundle, MODEL_FILE + ".tmp")
+        joblib.dump({"models": train_models(features, energies), "features": FEATURES}, MODEL_FILE + ".tmp")
         os.replace(MODEL_FILE + ".tmp", MODEL_FILE)
         meta["trained"] = now
         log(f"trained on {len(energies)} hours from {meta['first']} to {meta['last']}; the candidate over the last "
             f"{days} days {model_error:.2f} kWh a day off, the plain forecast {plain_error:.2f} ({each_string})")
-        log(f"band: factors {band['factors'][0]:.2f} below and {band['factors'][1]:.2f} above, fitted on the rest of "
-            f"{band['days']} days from {BAND_FROM_HOUR}:00, where the raw quantiles left "
-            f"{band['raw_outside'][0]:.0%} below and {band['raw_outside'][1]:.0%} above" if band else
-            f"band: none, fewer than {BAND_MIN_DAYS} days to fit it on")
-    elif "band" in old_meta:
-        meta["band"] = old_meta["band"]
     else:
         log(f"WARNING: the candidate over the last {days} days {model_error:.2f} kWh a day off, the plain forecast "
             f"{plain_error:.2f} ({each_string}): the model of {old_meta.get('trained')} stays")
@@ -960,13 +884,11 @@ def train():
 
 # ---------------------------------------------------------------- the forecast into openHAB
 
-def publish(hours, source, trained, bands=None):
+def publish(hours, source, trained):
     """hours [[hour's start, the house's W, string 1's W, string 2's W, ...], ...] into openHAB's items and their
-    forecast series, and with bands ([[the band's low W, high W], ...], one per hour) the band into
-    pv_forecast_hourly's hours and the band's items; returns the number of points written"""
+    forecast series; returns the number of points written"""
     now = time.time()
-    hourly = {"at": int(now), "trained": trained, "source": source,
-              "h": [hour[:2] + (band if bands else []) for hour, band in zip(hours, bands or [None] * len(hours))]}
+    hourly = {"at": int(now), "trained": trained, "source": source, "h": [hour[:2] for hour in hours]}
     openhab_request("PUT", f"/items/{HOURLY_ITEM}/state", json.dumps(hourly), "text/plain")
     try:
         sent = json.load(open(SENT_FILE))
@@ -982,10 +904,6 @@ def publish(hours, source, trained, bands=None):
         if day >= today:
             day_totals[day] = day_totals.get(day, 0.0) + house_watts / 1000
     points.update({(ENERGY_ITEM, day_end(day)): round(kwh, 2) for day, kwh in day_totals.items()})
-    if bands and BAND_ITEMS:
-        for (hour_start, *_), (low, high) in zip(hours, bands):
-            points.update({(item, hour_start + 1800): watts
-                           for item, watts in zip(BAND_ITEMS, (low, high, high - low))})
     written = 0
     for (item, epoch), value in points.items():
         if sent.get(f"{item} {epoch}") != value:
@@ -995,11 +913,6 @@ def publish(hours, source, trained, bands=None):
     running_hour = next((powers for hour_start, *powers in hours if hour_start <= now < hour_start + 3600),
                         [None] * len(POWER_ITEMS))
     states = {item: "UNDEF" if watts is None else f"{watts} W" for item, watts in zip(POWER_ITEMS, running_hour)}
-    if BAND_ITEMS:
-        running = next((band for (hour_start, *_), band in zip(hours, bands or [])
-                        if hour_start <= now < hour_start + 3600), None)
-        values = (running[0], running[1], running[1] - running[0]) if running else None
-        states.update({item: f"{values[index]} W" if values else "UNDEF" for index, item in enumerate(BAND_ITEMS)})
     for item, day in ((ENERGY_ITEM, today), (ENERGY_TOMORROW_ITEM, today + datetime.timedelta(days=1))):
         if day in day_totals:
             states[item] = f"{round(day_totals[day], 2)} kWh"
@@ -1020,16 +933,11 @@ def forecast():
     weather = {hour: row for hour, row in weather.items() if all(f"best_match_{plane}" in row for plane in PLANES)}
     hour_starts = sorted(weather)
     vectors, elevations = zip(*(feature_vector(hour, weather[hour], latitude, longitude) for hour in hour_starts))
-    band = None
     if os.path.exists(MODEL_FILE):
         import joblib
         bundle = joblib.load(MODEL_FILE)
         assert bundle["features"] == FEATURES and "models" in bundle, "features changed, train again"
-        matrix = np.array(vectors, dtype=float)
-        predicted, source = predict_energies(bundle["models"], matrix), "ml"
-        if "band" in bundle:
-            band = house_band(predicted.sum(1), predict_energies(bundle["band"]["low"], matrix).sum(1),
-                              predict_energies(bundle["band"]["high"], matrix).sum(1), bundle["band"]["factors"])
+        predicted, source = predict_energies(bundle["models"], np.array(vectors, dtype=float)), "ml"
     elif "plain_factor" in meta:
         predicted = [[meta["plain_factor"] * physical_estimate(weather[hour], string.planes) for string in STRINGS]
                      for hour in hour_starts]
@@ -1038,33 +946,22 @@ def forecast():
         raise RuntimeError("no model and no training yet: run train")
     plane_kwh = split_forecast(predicted, np.array(vectors, dtype=float), weather, hour_starts, load_planes_bundle(),
                                meta.get("planes", {}).get("factors", {}))
-    # the strings and the planes rounded to whole W, the house the strings' sum; the band round the house's, within it
-    hours, bands = [], []
-    for index, (hour_start, string_kwh, planes_kwh, elevation) in enumerate(zip(hour_starts, predicted, plane_kwh,
-                                                                                 elevations)):
+    # the strings and the planes rounded to whole W, the house the strings' sum
+    hours = []
+    for hour_start, string_kwh, planes_kwh, elevation in zip(hour_starts, predicted, plane_kwh, elevations):
         daylight = elevation > DAYLIGHT_ELEVATION
         string_watts = [round(float(kwh) * 1000) if daylight else 0 for kwh in string_kwh]
         plane_watts = [round(float(kwh) * 1000) if daylight else 0 for kwh in planes_kwh]
         hours.append([hour_start, sum(string_watts), *string_watts, *plane_watts])
-        if band is not None:
-            house = sum(string_watts)
-            bands.append([min(round(float(band[0][index]) * 1000), house) if daylight else 0,
-                          max(round(float(band[1][index]) * 1000), house) if daylight else 0])
-    written = publish(hours, source, meta.get("trained"), bands if band is not None else None)
+    written = publish(hours, source, meta.get("trained"))
     day_totals = {}
     for hour_start, *watts in hours:
         day = local_day(hour_start)
         day_totals[day] = [total + w / 1000 for total, w in zip(day_totals.get(day, [0.0] * len(watts)), watts)]
-    band_totals = {}
-    for (hour_start, *_), (low, high) in zip(hours, bands):
-        totals = band_totals.setdefault(local_day(hour_start), [0.0, 0.0])
-        totals[0] += low / 1000
-        totals[1] += high / 1000
     strings_end = 1 + len(STRINGS)
     log(f"forecast ({source}): "
         + ", ".join(f"{day} {totals[0]:.1f} kWh ({' + '.join(f'{kwh:.1f}' for kwh in totals[1:strings_end])}"
                     + "".join(f"; {item.plane} {kwh:.1f}" for item, kwh in zip(MEASURED_PLANES, totals[strings_end:]))
-                    + (f"; band {band_totals[day][0]:.1f}-{band_totals[day][1]:.1f}" if day in band_totals else "")
                     + ")"
                     for day, totals in sorted(day_totals.items()) if totals[0] > 0)
         + f"; {written} points written")
@@ -1092,8 +989,8 @@ def backfill(first, apply):
             log(f"  {month:%Y-%m}: skipped (less than 90 days to train a candidate on)")
             month = next_month
             continue
-        ((model_error, plain_error, days), *_), _ = check_candidate(hours, features, energies, estimates, check_start,
-                                                                    month_start)
+        (model_error, plain_error, days), *_ = check_candidate(hours, features, energies, estimates, check_start,
+                                                               month_start)
         if model_error <= CHECK_TOLERANCE * plain_error:
             before = hours < month_start
             predicted[in_month] = predict_energies(train_models(features[before], energies[before]), features[in_month])
@@ -1216,100 +1113,6 @@ def backfill_planes(first, apply):
     log(f"written {len(points)} points; the old ones in {backup}")
 
 
-def backfill_band(first, apply):
-    """the band's series from first up to its first point (it replaces none): month by month as the nightly training
-    would have made it, the factors fitted on the CHECK_DAYS days before the month with a candidate and quantile models
-    trained on the hours before those (not with fewer than 90 days to train on, as backfill), the quantile models of
-    the month trained on the hours before it; the band round the house's forecast as stored, 0 at night. Logs for
-    each month how often the measurement fell below and above it, of the rest of a day from BAND_FROM_HOUR and of the
-    whole day"""
-    import numpy as np
-    if not BAND_ITEMS:
-        log("no band items (PV_FORECAST_ML_BAND_ITEMS): nothing to do")
-        return
-    weather_cache = load_weather_cache()
-    latitude, longitude = location()
-    measured = update_measured_cache()
-    hours, features, energies, _ = training_data(weather_cache, measured, latitude, longitude)
-    start = day_start(first)
-    held = [epoch for epoch, _ in read_history(BAND_ITEMS[0], start, time.time()) if epoch >= start]
-    end = int(min(held)) - 1800 if held else day_start(datetime.datetime.now(TIMEZONE).date())
-    # the house's stored forecast: each hour's mean at its middle
-    stored = {int(epoch) - 1800: watts for epoch, watts in read_history(HOUSE_POWER_ITEM, start, end)
-              if start <= epoch - 1800 < end and (int(epoch) - 1800) % 3600 == 0}
-    points, missed = [], {"rest": [0, 0, 0], "day": [0, 0, 0]}
-    month = datetime.date(first.year, first.month, 1)
-    while day_start(month) < end:
-        next_month = (month + datetime.timedelta(days=32)).replace(day=1)
-        month_start = day_start(max(month, first))
-        month_hours = sorted(hour for hour in stored if month_start <= hour < day_start(next_month)
-                             and hour in weather_cache)
-        split = day_start(max(month, first) - datetime.timedelta(days=CHECK_DAYS))
-        if not month_hours:
-            month = next_month
-            continue
-        if split - hours[0] < 90 * 86400:
-            log(f"  {month:%Y-%m}: skipped (less than 90 days to train a candidate on)")
-            month = next_month
-            continue
-        before_split, checked = hours < split, (hours >= split) & (hours < month_start)
-        candidate = train_models(features[before_split], energies[before_split])
-        band = band_factors(hours, features, energies, split, month_start,
-                            predict_energies(candidate, features[checked]))
-        if band is None:
-            log(f"  {month:%Y-%m}: skipped (fewer than {BAND_MIN_DAYS} days to fit the factors on)")
-            month = next_month
-            continue
-        before = hours < month_start
-        low_models, high_models = train_band(features[before], energies[before])
-        vectors, elevations = zip(*(feature_vector(hour, weather_cache[hour], latitude, longitude)
-                                    for hour in month_hours))
-        matrix = np.array(vectors, dtype=float)
-        house = np.array([stored[hour] / 1000 for hour in month_hours])
-        lower, upper = house_band(house, predict_energies(low_models, matrix).sum(1),
-                                  predict_energies(high_models, matrix).sum(1), band["factors"])
-        days = {}
-        for hour, low, high, elevation in zip(month_hours, lower, upper, elevations):
-            daylight = elevation > DAYLIGHT_ELEVATION
-            watts = round(stored[hour])
-            low_watts = min(round(float(low) * 1000), watts) if daylight else 0
-            high_watts = max(round(float(high) * 1000), watts) if daylight else 0
-            points += [(item, hour + 1800, f"{value} W")
-                       for item, value in zip(BAND_ITEMS, (low_watts, high_watts, high_watts - low_watts))]
-            if hour in measured:
-                rest = datetime.datetime.fromtimestamp(hour, TIMEZONE).hour >= BAND_FROM_HOUR
-                totals = days.setdefault(local_day(hour), [0.0] * 6)
-                for offset, counted in ((0, True), (3, rest)):
-                    if counted:
-                        totals[offset] += low_watts / 1000
-                        totals[offset + 1] += high_watts / 1000
-                        totals[offset + 2] += sum(measured[hour])
-        figures = []
-        for key, offset in (("day", 0), ("rest", 3)):
-            below = sum(totals[offset + 2] < totals[offset] - 0.005 for totals in days.values())
-            above = sum(totals[offset + 2] > totals[offset + 1] + 0.005 for totals in days.values())
-            missed[key] = [missed[key][0] + below, missed[key][1] + above, missed[key][2] + len(days)]
-            figures.append(f"{below} below and {above} above")
-        log(f"  {month:%Y-%m}: factors {band['factors'][0]:.2f} below and {band['factors'][1]:.2f} above; of "
-            f"{len(days)} days {figures[1]} from {BAND_FROM_HOUR}:00, {figures[0]} over the whole day")
-        month = next_month
-    if not points:
-        log("nothing to write")
-        return
-    for key, text in (("rest", f"the rest of a day from {BAND_FROM_HOUR}:00"), ("day", "the whole day")):
-        below, above, count = missed[key]
-        if count:
-            log(f"{text}: {below / count:.1%} of {count} days below the band, {above / count:.1%} above")
-    hours_written = len(points) // len(BAND_ITEMS)
-    if not apply:
-        log(f"would write {len(points)} points ({hours_written} hours); --apply writes them")
-        return
-    for item, epoch, state in points:
-        store_point(item, epoch, state)
-    log(f"written {len(points)} points ({hours_written} hours) from {iso_time(min(e for _, e, _ in points))} to "
-        f"{iso_time(max(e for _, e, _ in points))}")
-
-
 def restore(path):
     """the points of a backup written back"""
     count = 0
@@ -1344,8 +1147,6 @@ if __name__ == "__main__":
         train()
     elif command == "forecast":
         forecast()
-    elif command == "backfill" and "--band" in sys.argv:
-        backfill_band(datetime.date.fromisoformat(sys.argv[2]), "--apply" in sys.argv)
     elif command == "backfill" and "--planes" in sys.argv:
         backfill_planes(datetime.date.fromisoformat(sys.argv[2]), "--apply" in sys.argv)
     elif command == "backfill":
